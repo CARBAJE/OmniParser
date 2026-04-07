@@ -20,15 +20,21 @@ from matplotlib import pyplot as plt
 import easyocr
 from paddleocr import PaddleOCR
 reader = easyocr.Reader(['en'])
+# Inicialización con la nueva API v3.x
 paddle_ocr = PaddleOCR(
-    lang='en',  # other lang also available
-    use_angle_cls=False,
-    use_gpu=False,  # using cuda will conflict with pytorch in the same process
-    show_log=False,
-    max_batch_size=1024,
-    use_dilation=True,  # improves accuracy
-    det_db_score_mode='slow',  # improves accuracy
-    rec_batch_num=1024)
+    lang='en', 
+    # Sustituye a use_angle_cls
+    use_textline_orientation=False, 
+    # Sustituye a use_gpu. Puedes usar 'gpu:0' si quieres activar la tarjeta gráfica
+    device='cpu', 
+    # Sustituye a rec_batch_num
+    text_recognition_batch_size=1024,
+    # Opcional: define la versión del modelo explícitamente si es necesario
+    ocr_version='PP-OCRv4',
+    # Si quieres el equivalente a use_dilation (ajusta el float según necesites)
+    text_det_unclip_ratio=2.0,
+    enable_mkldnn=False  # <--- ESTA ES LA CLAVE PARA EVITAR EL CRASH DE ONEDNN
+)
 import time
 import base64
 
@@ -60,7 +66,7 @@ def get_caption_model_processor(model_name, model_name_or_path="Salesforce/blip2
         ).to(device)
     elif model_name == "florence2":
         from transformers import AutoProcessor, AutoModelForCausalLM 
-        processor = AutoProcessor.from_pretrained("microsoft/Florence-2-base", trust_remote_code=True)
+        processor = AutoProcessor.from_pretrained("microsoft/Florence-2-base", trust_remote_code=True, revision='main')
         if device == 'cpu':
             model = AutoModelForCausalLM.from_pretrained(model_name_or_path, torch_dtype=torch.float32, trust_remote_code=True)
         else:
@@ -429,14 +435,24 @@ def get_som_labeled_img(image_source: Union[str, Image.Image], model=None, BOX_T
         ocr_bbox=ocr_bbox.tolist()
     else:
         print('no ocr bbox!!!')
-        ocr_bbox = None
+        ocr_bbox = []
+        ocr_text = []
 
     ocr_bbox_elem = [{'type': 'text', 'bbox':box, 'interactivity':False, 'content':txt, 'source': 'box_ocr_content_ocr'} for box, txt in zip(ocr_bbox, ocr_text) if int_box_area(box, w, h) > 0] 
     xyxy_elem = [{'type': 'icon', 'bbox':box, 'interactivity':True, 'content':None} for box in xyxy.tolist() if int_box_area(box, w, h) > 0]
-    filtered_boxes = remove_overlap_new(boxes=xyxy_elem, iou_threshold=iou_threshold, ocr_bbox=ocr_bbox_elem)
     
+    filtered_boxes = remove_overlap_new(boxes=xyxy_elem, iou_threshold=iou_threshold, ocr_bbox=ocr_bbox_elem)
+
+    # --- PARCHE PARA EL BUG #338 DE OMNIPARSER ---
+    # Si la función devolvió listas de coordenadas en lugar de diccionarios, los reconstruimos
+    for i in range(len(filtered_boxes)):
+        if isinstance(filtered_boxes[i], list) or type(filtered_boxes[i]).__name__ == 'ndarray':
+            filtered_boxes[i] = {'type': 'icon', 'bbox': filtered_boxes[i], 'interactivity': True, 'content': None}
+    # ---------------------------------------------
+
     # sort the filtered_boxes so that the one with 'content': None is at the end, and get the index of the first 'content': None
     filtered_boxes_elem = sorted(filtered_boxes, key=lambda x: x['content'] is None)
+    
     # get the index of the first 'content': None
     starting_idx = next((i for i, box in enumerate(filtered_boxes_elem) if box['content'] is None), -1)
     filtered_boxes = torch.tensor([box['bbox'] for box in filtered_boxes_elem])
@@ -501,6 +517,34 @@ def get_xywh_yolo(input):
     x, y, w, h = int(x), int(y), int(w), int(h)
     return x, y, w, h
 
+def parse_paddleocr_result(image_np, text_threshold):
+    """
+    Función auxiliar para procesar los resultados de PaddleOCR 
+    soportando tanto la versión 2.x (listas) como la 3.x (diccionarios).
+    """
+    raw_result = paddle_ocr.ocr(image_np)
+    result = raw_result[0] if raw_result and len(raw_result) > 0 else None
+
+    coord = []
+    text = []
+
+    if result is not None:
+        # Nuevo formato de PaddleOCR v3 (Diccionario)
+        if isinstance(result, dict) or hasattr(result, 'keys'):
+            for poly, txt, score in zip(result.get('dt_polys', []), result.get('rec_text', []), result.get('rec_score', [])):
+                if score > text_threshold:
+                    coord.append(poly)
+                    text.append(txt)
+        # Formato clásico de PaddleOCR v2 (Lista de listas)
+        elif isinstance(result, list):
+            for item in result:
+                if item and item[1][1] > text_threshold:
+                    coord.append(item[0])
+                    text.append(item[1][0])
+                    
+    return coord, text
+
+
 def check_ocr_box(image_source: Union[str, Image.Image], display_img = True, output_bb_format='xywh', goal_filtering=None, easyocr_args=None, use_paddleocr=False):
     if isinstance(image_source, str):
         image_source = Image.open(image_source)
@@ -509,20 +553,24 @@ def check_ocr_box(image_source: Union[str, Image.Image], display_img = True, out
         image_source = image_source.convert('RGB')
     image_np = np.array(image_source)
     w, h = image_source.size
+    
     if use_paddleocr:
         if easyocr_args is None:
             text_threshold = 0.5
         else:
-            text_threshold = easyocr_args['text_threshold']
-        result = paddle_ocr.ocr(image_np, cls=False)[0]
-        coord = [item[0] for item in result if item[1][1] > text_threshold]
-        text = [item[1][0] for item in result if item[1][1] > text_threshold]
+            # Usar .get() es más seguro por si la llave no existe
+            text_threshold = easyocr_args.get('text_threshold', 0.5)
+            
+        # --- AQUÍ LLAMAMOS A LA NUEVA FUNCIÓN ---
+        coord, text = parse_paddleocr_result(image_np, text_threshold)
+        
     else:  # EasyOCR
         if easyocr_args is None:
             easyocr_args = {}
         result = reader.readtext(image_np, **easyocr_args)
         coord = [item[0] for item in result]
         text = [item[1] for item in result]
+        
     if display_img:
         opencv_img = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
         bb = []
@@ -530,11 +578,12 @@ def check_ocr_box(image_source: Union[str, Image.Image], display_img = True, out
             x, y, a, b = get_xywh(item)
             bb.append((x, y, a, b))
             cv2.rectangle(opencv_img, (x, y), (x+a, y+b), (0, 255, 0), 2)
-        #  matplotlib expects RGB
+        # matplotlib expects RGB
         plt.imshow(cv2.cvtColor(opencv_img, cv2.COLOR_BGR2RGB))
     else:
         if output_bb_format == 'xywh':
             bb = [get_xywh(item) for item in coord]
         elif output_bb_format == 'xyxy':
             bb = [get_xyxy(item) for item in coord]
+            
     return (text, bb), goal_filtering
